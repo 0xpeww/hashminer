@@ -1,22 +1,23 @@
 require("dotenv").config();
 
-const { ethers }    = require("ethers");
-const { execFile }  = require("child_process");
-const os            = require("os");
-const fs            = require("fs");
-const path          = require("path");
+const { ethers }     = require("ethers");
+const { execFile }   = require("child_process");
+const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
+const os             = require("os");
+const fs             = require("fs");
+const path           = require("path");
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // CONFIG
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 const RPC_URL          = process.env.RPC_URL;
 const PRIVATE_KEY      = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
-const GPU_BINARY       = process.env.GPU_BINARY  || path.join(__dirname, "miner_gpu");
-const BATCH_SIZE       = process.env.BATCH_SIZE  || "67108864";   // 64M nonce per batch
-const LOG_FILE         = path.join(__dirname, "miner.log");
-const USE_CPU_FALLBACK = process.env.CPU_FALLBACK !== "false";
+const GPU_BINARY       = process.env.GPU_BINARY   || path.join(__dirname, "miner_gpu");
+const BATCH_SIZE       = process.env.BATCH_SIZE   || "67108864";   // 64M per GPU per batch
 const NUM_CPU_CORES    = parseInt(process.env.CORES) || os.cpus().length;
+const CPU_FALLBACK     = process.env.CPU_FALLBACK !== "false";
+const LOG_FILE         = path.join(__dirname, "miner.log");
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -24,9 +25,9 @@ const ABI = [
   "function mine(uint256 nonce)"
 ];
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // LOGGER
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 const logStream = fs.createWriteStream(LOG_FILE, { flags: "a" });
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -34,78 +35,103 @@ function log(msg) {
   logStream.write(line + "\n");
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ENV CHECK
-// ═══════════════════════════════════════════════════════════════
 function checkEnv() {
-  if (!RPC_URL || !PRIVATE_KEY) {
-    console.error("ERROR: Set RPC_URL dan PRIVATE_KEY di .env");
-    process.exit(1);
-  }
-  if (!PRIVATE_KEY.startsWith("0x")) {
-    console.error("ERROR: PRIVATE_KEY harus diawali 0x");
-    process.exit(1);
-  }
+  if (!RPC_URL || !PRIVATE_KEY) { log("ERROR: Set RPC_URL dan PRIVATE_KEY di .env"); process.exit(1); }
+  if (!PRIVATE_KEY.startsWith("0x")) { log("ERROR: PRIVATE_KEY harus 0x..."); process.exit(1); }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// GPU MINING: jalankan binary CUDA
-// ═══════════════════════════════════════════════════════════════
-function gpuMineBatch(challenge, difficultyHex, startNonce) {
+// ═══════════════════════════════════════════════════
+// DETECT GPUs
+// ═══════════════════════════════════════════════════
+function detectGPUs() {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(GPU_BINARY)) { resolve([]); return; }
+    execFile("nvidia-smi", ["--query-gpu=name,memory.total", "--format=csv,noheader"],
+      { timeout: 5000 }, (err, stdout) => {
+        if (err || !stdout.trim()) { resolve([]); return; }
+        const gpus = stdout.trim().split("\n").map((line, i) => ({
+          id: i,
+          name: line.split(",")[0].trim()
+        }));
+        resolve(gpus);
+      }
+    );
+  });
+}
+
+// ═══════════════════════════════════════════════════
+// SINGLE GPU BATCH
+// ═══════════════════════════════════════════════════
+function gpuBatch(challenge, diffHex, startNonce, gpuId) {
   return new Promise((resolve, reject) => {
     execFile(
       GPU_BINARY,
-      [challenge, difficultyHex, startNonce.toString(), BATCH_SIZE],
-      { timeout: 120_000 },
+      [challenge, diffHex, startNonce.toString(), BATCH_SIZE, gpuId.toString()],
+      { timeout: 300_000 },
       (err, stdout, stderr) => {
-        if (err) return reject(err);
+        if (err) return reject(new Error(`GPU[${gpuId}] error: ${err.message}`));
         const out = stdout.trim();
         if (out.startsWith("FOUND")) {
-          const parts = out.split(" ");
-          resolve({ found: true, nonce: parts[1], hash: parts[2] });
+          const p = out.split(" ");
+          resolve({ found: true, nonce: p[1], hash: p[2], gpuId });
         } else {
-          resolve({ found: false });
+          resolve({ found: false, gpuId });
         }
       }
     );
   });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// GPU MINING ROUND: loop batch sampai nonce ketemu
-// ═══════════════════════════════════════════════════════════════
-async function mineWithGPU(challenge, difficultyHex) {
-  log("🖥️  Mode: CUDA GPU Mining");
+// ═══════════════════════════════════════════════════
+// MULTI-GPU MINING ROUND
+// Semua GPU jalan paralel, masing-masing cari nonce
+// di range nonce yang BERBEDA agar tidak overlap
+// ═══════════════════════════════════════════════════
+async function mineWithGPUs(challenge, diffHex, gpus) {
+  const numGPUs  = gpus.length;
+  const batch    = BigInt(BATCH_SIZE);
+  const t0       = Date.now();
+  let   total    = 0n;
+  let   peakRate = 0;
 
-  const batch  = BigInt(BATCH_SIZE);
-  let nonce    = BigInt(Math.floor(Math.random() * 1e15)); // random start
-  let total    = 0n;
-  const t0     = Date.now();
+  // Random base nonce, tiap GPU dapat slice berbeda
+  const BASE = BigInt(Math.floor(Math.random() * 1e15));
 
   const ticker = setInterval(() => {
     const secs = (Date.now() - t0) / 1000;
-    const rate = Number(total) / secs;
+    const rate = Math.floor(Number(total) / secs);
+    if (rate > peakRate) peakRate = rate;
     process.stdout.write(
-      `\r  \x1b[33m${Math.floor(rate).toLocaleString()}\x1b[0m H/s` +
-      ` | ${(Number(total) / 1e9).toFixed(2)} GH` +
-      ` | ${secs.toFixed(0)}s [GPU]   `
+      `\r  \x1b[33m${rate.toLocaleString()}\x1b[0m H/s` +
+      ` | ${(Number(total)/1e9).toFixed(2)} GH` +
+      ` | peak ${peakRate.toLocaleString()} H/s` +
+      ` | ${numGPUs} GPU | ${secs.toFixed(0)}s   `
     );
   }, 1000);
 
   try {
+    let round = 0n;
     while (true) {
-      const result = await gpuMineBatch(challenge, difficultyHex, nonce);
-      total += batch;
+      // Tiap GPU: start_nonce = BASE + (gpuId + round*numGPUs) * batch
+      const promises = gpus.map(gpu => {
+        const startNonce = BASE + (BigInt(gpu.id) + round * BigInt(numGPUs)) * batch;
+        return gpuBatch(challenge, diffHex, startNonce, gpu.id);
+      });
 
-      if (result.found) {
+      const results = await Promise.all(promises);
+      total += batch * BigInt(numGPUs);
+
+      const found = results.find(r => r.found);
+      if (found) {
         clearInterval(ticker);
         process.stdout.write("\n");
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
         const rate = Math.floor(Number(total) / parseFloat(secs));
-        return { nonce: result.nonce, hash: result.hash, secs, rate, totalAttempts: Number(total) };
+        log(`✅ GPU[${found.gpuId}] menemukan nonce!`);
+        return { nonce: found.nonce, hash: found.hash, secs, rate, totalAttempts: Number(total), mode: "GPU" };
       }
 
-      nonce += batch;
+      round++;
     }
   } catch (e) {
     clearInterval(ticker);
@@ -113,11 +139,9 @@ async function mineWithGPU(challenge, difficultyHex) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // CPU FALLBACK (worker_threads)
-// ═══════════════════════════════════════════════════════════════
-const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
-
+// ═══════════════════════════════════════════════════
 function workerStartNonce(id, total) {
   const MAX   = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
   const slice = MAX / BigInt(total);
@@ -125,144 +149,92 @@ function workerStartNonce(id, total) {
 }
 
 function mineWithCPU(challenge, difficulty) {
-  log(`🔧  Mode: CPU Fallback (${NUM_CPU_CORES} cores)`);
+  log(`🔧 CPU Fallback: ${NUM_CPU_CORES} cores`);
   return new Promise((resolve, reject) => {
-    const workers        = [];
-    const workerAttempts = new Array(NUM_CPU_CORES).fill(0);
-    let found            = false;
-    let totalAttempts    = 0;
-    let peakRate         = 0;
-    const t0             = Date.now();
-    const REPORT_EVERY   = 1_000_000;
+    const workers = [];
+    const wAttempts = new Array(NUM_CPU_CORES).fill(0);
+    let found = false, total = 0, peak = 0;
+    const t0 = Date.now();
+    const REPORT = 1_000_000;
 
     const ticker = setInterval(() => {
       const secs = (Date.now() - t0) / 1000;
-      const rate = Math.floor(totalAttempts / secs);
-      if (rate > peakRate) peakRate = rate;
+      const rate = Math.floor(total / secs);
+      if (rate > peak) peak = rate;
       process.stdout.write(
         `\r  \x1b[32m${rate.toLocaleString()}\x1b[0m H/s` +
-        ` | ${(totalAttempts / 1e6).toFixed(1)}M hashes` +
-        ` | peak ${peakRate.toLocaleString()} H/s` +
-        ` | ${NUM_CPU_CORES} cores | ${secs.toFixed(0)}s [CPU]   `
+        ` | ${(total/1e6).toFixed(1)}M | peak ${peak.toLocaleString()} H/s` +
+        ` | ${NUM_CPU_CORES} CPU | ${secs.toFixed(0)}s   `
       );
     }, 1000);
 
     for (let i = 0; i < NUM_CPU_CORES; i++) {
       const w = new Worker(__filename, {
-        workerData: { challenge, difficulty, startNonce: workerStartNonce(i, NUM_CPU_CORES), workerId: i, REPORT_EVERY }
+        workerData: { challenge, difficulty, startNonce: workerStartNonce(i, NUM_CPU_CORES), workerId: i, REPORT }
       });
-      w.on("message", (msg) => {
-        if (msg.type === "progress") {
-          totalAttempts += msg.attempts - workerAttempts[msg.workerId];
-          workerAttempts[msg.workerId] = msg.attempts;
-        }
+      w.on("message", msg => {
+        if (msg.type === "progress") { total += msg.attempts - wAttempts[msg.workerId]; wAttempts[msg.workerId] = msg.attempts; }
         if (msg.type === "found" && !found) {
           found = true;
           clearInterval(ticker);
-          workers.forEach(w => { try { w.terminate(); } catch (_) {} });
-          const secs = ((Date.now() - t0) / 1000).toFixed(1);
-          const rate = Math.floor(totalAttempts / parseFloat(secs));
+          workers.forEach(w => { try { w.terminate(); } catch(_){} });
           process.stdout.write("\n");
-          resolve({ nonce: msg.nonce, hash: msg.hash, secs, rate, totalAttempts });
+          const secs = ((Date.now()-t0)/1000).toFixed(1);
+          resolve({ nonce: msg.nonce, hash: msg.hash, secs, rate: Math.floor(total/parseFloat(secs)), totalAttempts: total, mode: "CPU" });
         }
       });
-      w.on("error", (err) => {
-        if (!found) { found = true; clearInterval(ticker); reject(err); }
-      });
+      w.on("error", err => { if (!found) { found=true; clearInterval(ticker); reject(err); } });
       workers.push(w);
     }
   });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// CPU WORKER THREAD CODE
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
+// CPU WORKER THREAD
+// ═══════════════════════════════════════════════════
 if (!isMainThread) {
-  const { challenge, difficulty, startNonce, workerId, REPORT_EVERY } = workerData;
-  const challengeBuf = Buffer.from(challenge.slice(2), "hex");
-  const packed       = Buffer.allocUnsafe(64);
-  const nonceBuf     = Buffer.allocUnsafe(32);
-  challengeBuf.copy(packed, 0);
+  const { challenge, difficulty, startNonce, workerId, REPORT } = workerData;
+  const cb = Buffer.from(challenge.slice(2), "hex");
+  const packed = Buffer.allocUnsafe(64); cb.copy(packed, 0);
+  const nb = Buffer.allocUnsafe(32);
+  const db = Buffer.from(BigInt(difficulty).toString(16).padStart(64,"0"), "hex");
+  let nonce = BigInt(startNonce), attempts = 0;
 
-  const diffBuf = Buffer.from(
-    BigInt(difficulty).toString(16).padStart(64, "0"), "hex"
-  );
-
-  let nonce    = BigInt(startNonce);
-  let attempts = 0;
-
-  function writeBE(buf, val) {
-    let v = val;
-    for (let i = 31; i >= 0; i--) { buf[i] = Number(v & 0xffn); v >>= 8n; }
-  }
-
-  function bufLT(a, b) {
-    for (let i = 0; i < 32; i++) {
-      if (a[i] < b[i]) return true;
-      if (a[i] > b[i]) return false;
-    }
-    return false;
-  }
+  const wBE = (buf, val) => { let v=val; for(let i=31;i>=0;i--){buf[i]=Number(v&0xffn);v>>=8n;} };
+  const ltBuf = (a,b) => { for(let i=0;i<32;i++){if(a[i]<b[i])return true;if(a[i]>b[i])return false;} return false; };
 
   let hashFn = null;
-  try { const { keccak256 } = require("js-sha3"); hashFn = (buf) => Buffer.from(keccak256.arrayBuffer(buf)); hashFn(Buffer.alloc(1)); } catch (_) {}
-  if (!hashFn) {
-    try { const Keccak = require("keccak"); hashFn = (buf) => Keccak("keccak256").update(buf).digest(); hashFn(Buffer.alloc(1)); } catch (_) {}
-  }
+  try { const {keccak256}=require("js-sha3"); hashFn=(b)=>Buffer.from(keccak256.arrayBuffer(b)); hashFn(Buffer.alloc(1)); } catch(_){}
+  if (!hashFn) { try { const K=require("keccak"); hashFn=(b)=>K("keccak256").update(b).digest(); hashFn(Buffer.alloc(1)); } catch(_){} }
 
   if (hashFn) {
     while (true) {
-      writeBE(nonceBuf, nonce); nonceBuf.copy(packed, 32);
-      const hash = hashFn(packed); attempts++;
-      if (bufLT(hash, diffBuf)) {
-        parentPort.postMessage({ type: "found", nonce: nonce.toString(), hash: "0x" + hash.toString("hex"), workerId });
-        break;
-      }
+      wBE(nb,nonce); nb.copy(packed,32);
+      const h=hashFn(packed); attempts++;
+      if (ltBuf(h,db)) { parentPort.postMessage({type:"found",nonce:nonce.toString(),hash:"0x"+h.toString("hex"),workerId}); break; }
       nonce++;
-      if (attempts % REPORT_EVERY === 0) parentPort.postMessage({ type: "progress", attempts, workerId });
+      if (attempts%REPORT===0) parentPort.postMessage({type:"progress",attempts,workerId});
     }
   } else {
-    const { solidityPackedKeccak256 } = require("ethers");
-    const diffBigInt = BigInt(difficulty);
+    const {solidityPackedKeccak256}=require("ethers");
+    const dBig=BigInt(difficulty);
     while (true) {
-      const hash = solidityPackedKeccak256(["bytes32", "uint256"], [challenge, nonce]); attempts++;
-      if (BigInt(hash) < diffBigInt) {
-        parentPort.postMessage({ type: "found", nonce: nonce.toString(), hash, workerId });
-        break;
-      }
+      const h=solidityPackedKeccak256(["bytes32","uint256"],[challenge,nonce]); attempts++;
+      if (BigInt(h)<dBig) { parentPort.postMessage({type:"found",nonce:nonce.toString(),hash:h,workerId}); break; }
       nonce++;
-      if (attempts % REPORT_EVERY === 0) parentPort.postMessage({ type: "progress", attempts, workerId });
+      if (attempts%REPORT===0) parentPort.postMessage({type:"progress",attempts,workerId});
     }
   }
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // MAIN THREAD
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 } else {
 
-  let gpuAvailable     = false;
-  let totalMints       = 0;
-  let totalHashes      = 0;
-  let peakHashrate     = 0;
-  const t0session      = Date.now();
+  function diffToHex(d) { return "0x"+BigInt(d).toString(16).padStart(64,"0"); }
 
-  async function detectGPU() {
-    return new Promise((resolve) => {
-      if (!fs.existsSync(GPU_BINARY)) { resolve(false); return; }
-      execFile("nvidia-smi", ["--query-gpu=name", "--format=csv,noheader"], { timeout: 5000 }, (err, stdout) => {
-        if (!err && stdout.trim()) {
-          log(`🎮 GPU detected: ${stdout.trim().split("\n")[0]}`);
-          resolve(true);
-        } else {
-          resolve(false);
-        }
-      });
-    });
-  }
-
-  function difficultyToHex(diffStr) {
-    return "0x" + BigInt(diffStr).toString(16).padStart(64, "0");
-  }
+  let totalMints=0, totalHashes=0, peakRate=0;
+  const t0session = Date.now();
 
   async function main() {
     checkEnv();
@@ -271,20 +243,25 @@ if (!isMainThread) {
     const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
     const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 
-    gpuAvailable = await detectGPU();
+    const gpus = await detectGPUs();
 
     log("==========================================");
-    log("  HASH256 Hybrid GPU+CPU Miner");
+    log("  HASH256 Multi-GPU + CPU Hybrid Miner");
     log("==========================================");
     log(`Wallet      : ${wallet.address}`);
     log(`Contract    : ${CONTRACT_ADDRESS}`);
-    log(`GPU Binary  : ${GPU_BINARY}`);
-    log(`GPU Mode    : ${gpuAvailable ? "✅ AKTIF" : "❌ tidak tersedia — pakai CPU"}`);
+    if (gpus.length > 0) {
+      log(`GPUs        : ${gpus.length}x GPU terdeteksi`);
+      gpus.forEach(g => log(`  GPU[${g.id}]  : ${g.name}`));
+    } else {
+      log(`GPUs        : ❌ tidak ada — pakai CPU`);
+    }
     log(`CPU Cores   : ${NUM_CPU_CORES} (fallback)`);
-    log(`Batch Size  : ${parseInt(BATCH_SIZE).toLocaleString()} nonces/batch`);
-    log(`Log file    : ${LOG_FILE}`);
+    log(`Batch Size  : ${parseInt(BATCH_SIZE).toLocaleString()} nonce/GPU/batch`);
+    log(`Log         : ${LOG_FILE}`);
     log("");
 
+    let useGPU = gpus.length > 0;
     let errors = 0;
 
     while (true) {
@@ -295,83 +272,82 @@ if (!isMainThread) {
         ]);
 
         const difficulty = state.difficulty.toString();
-        const diffHex    = difficultyToHex(difficulty);
+        const diffHex    = diffToHex(difficulty);
         const epochNow   = state.epoch.toString();
-        const uptime     = ((Date.now() - t0session) / 60000).toFixed(1);
+        const uptime     = ((Date.now()-t0session)/60000).toFixed(1);
 
         log("------------------------------------------");
         log(`Era        : ${state.era}`);
-        log(`Reward     : ${ethers.formatUnits(state.reward, 18)} HASH`);
+        log(`Reward     : ${ethers.formatUnits(state.reward,18)} HASH`);
         log(`Difficulty : ${difficulty}`);
         log(`Epoch      : ${epochNow} | Remaining: ${state.remaining} blok`);
         log(`Challenge  : ${challenge}`);
         log(`Session    : ${totalMints} mints | ${(totalHashes/1e9).toFixed(2)} GH | uptime ${uptime} mnt`);
+        if (useGPU) log(`Mining dengan ${gpus.length} GPU paralel...`);
+        else        log(`Mining dengan ${NUM_CPU_CORES} CPU cores...`);
 
         let result;
-        if (gpuAvailable) {
+        if (useGPU) {
           try {
-            result = await mineWithGPU(challenge, diffHex);
-          } catch (gpuErr) {
-            log(`⚠️  GPU error: ${gpuErr.message} — fallback ke CPU`);
-            gpuAvailable = false;
+            result = await mineWithGPUs(challenge, diffHex, gpus);
+          } catch (e) {
+            log(`⚠️  GPU error: ${e.message} — fallback CPU`);
+            useGPU = false;
             result = await mineWithCPU(challenge, difficulty);
           }
-        } else {
+        } else if (CPU_FALLBACK) {
           result = await mineWithCPU(challenge, difficulty);
+        } else {
+          log("ERROR: GPU tidak ada dan CPU_FALLBACK=false"); process.exit(1);
         }
 
         totalHashes += result.totalAttempts;
-        if (result.rate > peakHashrate) peakHashrate = result.rate;
+        if (result.rate > peakRate) peakRate = result.rate;
 
         log(`Nonce      : ${result.nonce}`);
         log(`Hash       : ${result.hash}`);
-        log(`Round      : ${result.secs}s | avg ${result.rate.toLocaleString()} H/s | peak ${peakHashrate.toLocaleString()} H/s`);
+        log(`Round      : ${result.secs}s | ${result.rate.toLocaleString()} H/s | peak ${peakRate.toLocaleString()} H/s [${result.mode}]`);
 
-        // Cek epoch masih sama
+        // Cek epoch
         const fresh = await contract.miningState();
         if (fresh.epoch.toString() !== epochNow) {
-          log("⚠️  Epoch berubah — skip, ulang ronde...");
-          errors = 0;
-          continue;
+          log("⚠️  Epoch berubah — skip, ulang ronde..."); errors=0; continue;
         }
 
         // Kirim TX
         try {
           let gas;
-          try {
-            gas = await contract.mine.estimateGas(BigInt(result.nonce));
-          } catch (e) {
-            log(`⚠️  Gas estimate gagal: ${e.shortMessage || e.message}`);
-            continue;
-          }
+          try { gas = await contract.mine.estimateGas(BigInt(result.nonce)); }
+          catch (e) { log(`⚠️  Gas estimate gagal: ${e.shortMessage||e.message}`); continue; }
           log("Mengirim TX...");
-          const tx = await contract.mine(BigInt(result.nonce), { gasLimit: gas + 15000n });
+          const tx = await contract.mine(BigInt(result.nonce), { gasLimit: gas+15000n });
           log(`TX         : ${tx.hash}`);
           const receipt = await tx.wait();
-          if (receipt.status === 1) {
+          if (receipt.status===1) {
             totalMints++;
+            const uptime = ((Date.now()-t0session)/60000).toFixed(1);
             log(`✓ MINT #${totalMints} | Block: ${receipt.blockNumber} | Uptime: ${uptime} mnt`);
-            log(`  Total: ${(totalHashes/1e9).toFixed(2)} GH | Peak: ${peakHashrate.toLocaleString()} H/s`);
+            log(`  Total: ${(totalHashes/1e9).toFixed(2)} GH | Peak: ${peakRate.toLocaleString()} H/s`);
           } else {
             log("✗ TX reverted");
           }
         } catch (txErr) {
-          log(`✗ TX error: ${txErr.shortMessage || txErr.message}`);
+          log(`✗ TX error: ${txErr.shortMessage||txErr.message}`);
         }
 
         errors = 0;
 
       } catch (err) {
         errors++;
-        log(`ERROR #${errors}: ${err.shortMessage || err.message}`);
-        const wait = Math.min(3000 * Math.pow(2, errors - 1), 60_000);
-        log(`Retry dalam ${wait / 1000}s...`);
-        await new Promise(r => setTimeout(r, wait));
+        log(`ERROR #${errors}: ${err.shortMessage||err.message}`);
+        const wait = Math.min(3000*Math.pow(2,errors-1), 60_000);
+        log(`Retry dalam ${wait/1000}s...`);
+        await new Promise(r=>setTimeout(r,wait));
       }
     }
   }
 
-  process.on("SIGINT",  () => { log(`\nStop. Mints: ${totalMints} | Peak: ${peakHashrate.toLocaleString()} H/s`); process.exit(0); });
-  process.on("SIGTERM", () => { log(`\nStop. Mints: ${totalMints} | Peak: ${peakHashrate.toLocaleString()} H/s`); process.exit(0); });
-  main().catch(err => { log(`FATAL: ${err.message}`); process.exit(1); });
+  process.on("SIGINT",  ()=>{ log(`\nStop. Mints: ${totalMints} | Peak: ${peakRate.toLocaleString()} H/s`); process.exit(0); });
+  process.on("SIGTERM", ()=>{ log(`\nStop. Mints: ${totalMints} | Peak: ${peakRate.toLocaleString()} H/s`); process.exit(0); });
+  main().catch(err=>{ log(`FATAL: ${err.message}`); process.exit(1); });
 }
