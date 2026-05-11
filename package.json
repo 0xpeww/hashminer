@@ -1,7 +1,7 @@
 {
   "name": "hashminer",
   "version": "2.0.0",
-  "description": "HASH256 GPU+CPU Hybrid Miner",
+  "description": "HASH256 Multi-GPU + CPU Hybrid Miner",
   "main": "miner.js",
   "scripts": {
     "start": "node miner.js",
