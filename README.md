@@ -28,7 +28,7 @@ HASH256 miner dengan **CUDA GPU** sebagai engine utama + CPU sebagai fallback ot
 ## ⚡ Install & Setup (Otomatis)
 
 ```bash
-git clone https://github.com/airdropumbrella/hashminer
+git clone https://github.com/0xpeww/hashminer
 cd hashminer
 
 # Salin file baru
